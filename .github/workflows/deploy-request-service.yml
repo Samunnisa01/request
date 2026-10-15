@@ -1,0 +1,163 @@
+name: CI/CD - Request Service
+
+# Place this file at: .github/workflows/deploy-request-service.yml
+# Modeled on saayam-for-all/data's deploy-lambda.yml, adapted for a
+# Java / Spring Boot service that ships as a Docker image (ECR -> EKS).
+#
+# ASSUMPTIONS (please confirm with the team before merging):
+#   - Build tool is Maven (pom.xml at repo root). A Gradle fallback is included.
+#   - Java 17. Change JAVA_VERSION if the project uses another version.
+#   - A Dockerfile exists at the repo root.
+#   - Deployment target is ECR + EKS (the MVP wiki page says EKS hosts the microservices).
+#   - Repository variables set: AWS_REGION, ECR_REPOSITORY, EKS_CLUSTER, K8S_DEPLOYMENT, K8S_NAMESPACE
+#   - Repository secrets set: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   - GitHub Environments named "test" and "main" exist (add required reviewers to "main").
+
+on:
+  pull_request:
+    branches:
+      - main
+      - test
+  push:
+    branches:
+      - main
+      - test
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        type: choice
+        options:
+          - test
+          - main
+      image_tag:
+        description: 'Image tag (leave empty to use the commit SHA)'
+        required: false
+        type: string
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '17'
+
+jobs:
+  # ============================================================
+  # CI - build, test, dependency review
+  # ============================================================
+  ci:
+    name: CI - Build, Test & Dependency Review
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Build and run tests
+        run: |
+          if [ -f pom.xml ]; then
+            mvn -B verify
+          elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            chmod +x gradlew
+            ./gradlew build
+          else
+            echo "No pom.xml or build.gradle found - nothing to build yet."
+          fi
+
+      # Flags newly added vulnerable dependencies in PRs (no API key needed).
+      - name: Dependency review
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
+  # ============================================================
+  # CD - build image, push to ECR, deploy to EKS
+  # Runs automatically on push to test/main, or manually.
+  # Approval gates live on the GitHub Environment, not in the script.
+  # ============================================================
+  deploy:
+    name: Deploy - ${{ github.event.inputs.environment || github.ref_name }}
+    needs: ci
+    if: >
+      always() &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && needs.ci.result == 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ github.event.inputs.environment || github.ref_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Manual runs deploy the selected environment's branch.
+          ref: ${{ github.event.inputs.environment || github.ref_name }}
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Build application
+        run: |
+          if [ -f pom.xml ]; then
+            mvn -B package -DskipTests
+          else
+            chmod +x gradlew
+            ./gradlew build -x test
+          fi
+
+      # Prefer OIDC (role-to-assume) over long-lived keys when the team is ready.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          # User input goes through env vars, never directly into the script.
+          INPUT_TAG: ${{ github.event.inputs.image_tag }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+        run: |
+          TAG="${INPUT_TAG:-${GITHUB_SHA}}"
+          IMAGE="${REGISTRY}/${REPOSITORY}:${TAG}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "Pushed image: $IMAGE"
+
+      - name: Deploy to EKS
+        env:
+          CLUSTER: ${{ vars.EKS_CLUSTER }}
+          DEPLOYMENT: ${{ vars.K8S_DEPLOYMENT }}
+          NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+          REGION: ${{ vars.AWS_REGION }}
+        run: |
+          aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
+          kubectl -n "$NAMESPACE" set image "deployment/${DEPLOYMENT}" "${DEPLOYMENT}=${IMAGE}"
+          kubectl -n "$NAMESPACE" rollout status "deployment/${DEPLOYMENT}" --timeout=300s
+          echo "Deployment completed successfully."
